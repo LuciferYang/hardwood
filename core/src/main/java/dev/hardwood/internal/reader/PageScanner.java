@@ -132,6 +132,9 @@ public class PageScanner {
                 }
 
                 ByteBuffer compressedData = buffer.slice(pageDataOffset, compressedSize);
+                if (header.crc() != null) {
+                    CrcValidator.assertCorrectCrc(header.crc(), compressedData, columnSchema.name());
+                }
                 int uncompressedSize = header.uncompressedPageSize();
 
                 dictionary = parseDictionary(compressedData, numValues, uncompressedSize,
@@ -229,6 +232,9 @@ public class PageScanner {
 
             int compressedSize = dictHeader.compressedPageSize();
             ByteBuffer compressedData = dictBuffer.slice(dictHeaderSize, compressedSize);
+            if (dictHeader.crc() != null) {
+                CrcValidator.assertCorrectCrc(dictHeader.crc(), compressedData, columnSchema.name());
+            }
             int numValues = dictHeader.dictionaryPageHeader().numValues();
             int uncompressedSize = dictHeader.uncompressedPageSize();
 

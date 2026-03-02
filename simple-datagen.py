@@ -1135,3 +1135,33 @@ print("\nGenerated page_index_test.parquet:")
 print("  - Encoding: PLAIN for id/value, DICTIONARY for category")
 print("  - Compression: UNCOMPRESSED")
 print(f"  - Data: {num_rows} rows with small page size (4096) and page index enabled")
+
+# ============================================================================
+# CRC Checksum Test Files
+# ============================================================================
+
+# 22. Plain encoding with CRC page checksums enabled
+pq.write_table(simple_table, 'core/src/test/resources/plain_with_crc.parquet',
+               write_page_checksum=True,
+               use_dictionary=False,
+               compression=None,
+               data_page_version='1.0')
+
+print("\nGenerated plain_with_crc.parquet:")
+print("  - Encoding: PLAIN (use_dictionary=False)")
+print("  - Compression: UNCOMPRESSED (compression=None)")
+print("  - CRC: Enabled (write_page_checksum=True)")
+print("  - Data: id=[1,2,3], value=[100,200,300] - NO NULLS")
+
+# 23. Dictionary encoding with CRC page checksums enabled
+pq.write_table(table_dict, 'core/src/test/resources/dictionary_with_crc.parquet',
+               write_page_checksum=True,
+               use_dictionary=['category'],
+               compression=None,
+               data_page_version='1.0')
+
+print("\nGenerated dictionary_with_crc.parquet:")
+print("  - Encoding: DICTIONARY for category column")
+print("  - Compression: UNCOMPRESSED (compression=None)")
+print("  - CRC: Enabled (write_page_checksum=True)")
+print("  - Data: id=[1,2,3,4,5], category=['A','B','A','C','B']")
