@@ -22,12 +22,5 @@ jobs:
             VERSION_LABEL="dev"
           fi
           gh api repos/hardwood-hq/hardwood-hq.github.io/dispatches \
-            --field event_type=publish-docs \
-            --field client_payload="$(cat <<EOF
-          {
-            "source_ref": "${{ github.sha }}",
-            "version": "$VERSION_LABEL",
-            "update_latest": true
-          }
-          EOF
-          )"
+            -f event_type=publish-docs \
+            -f "client_payload={\"source_ref\":\"${{ github.sha }}\",\"version\":\"$VERSION_LABEL\",\"update_latest\":true}"
