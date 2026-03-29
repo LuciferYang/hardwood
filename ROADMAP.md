@@ -295,7 +295,7 @@ A from-scratch implementation of Apache Parquet reader/writer in Java with no de
 - [ ] Statistics serialization
 
 ### 9.2 Page Index (Column Index & Offset Index)
-- [x] Implement `ColumnIndex` structure (deserialized but not yet used for page-level filtering)
+- [x] Implement `ColumnIndex` structure
   - [x] Null pages tracking
   - [x] Min/max values per page
   - [x] Boundary order
@@ -305,8 +305,8 @@ A from-scratch implementation of Apache Parquet reader/writer in Java with no de
 - [x] Page index reading (`ColumnIndexReader`, `OffsetIndexReader`)
 - [x] Coalesced index fetching (`RowGroupIndexBuffers` — single read per row group)
 - [x] OffsetIndex-based page scanning (`PageScanner.scanPagesFromIndex()`)
+- [x] Page skipping based on ColumnIndex min/max (`PageFilterEvaluator`, integrated with `FileManager` for page-range I/O)
 - [ ] Page index writing
-- [ ] Page skipping based on ColumnIndex min/max
 
 ### 9.3 Bloom Filters
 - [ ] Implement split block bloom filter
@@ -319,11 +319,11 @@ A from-scratch implementation of Apache Parquet reader/writer in Java with no de
 - [x] Implement `FilterPredicate` hierarchy (sealed interface)
   - [x] Eq, NotEq
   - [x] Lt, LtEq, Gt, GtEq
-  - [ ] In
+  - [x] In (int, long, String)
   - [x] And, Or, Not
 - [x] Statistics-based row group filtering (`RowGroupFilterEvaluator`)
 - [x] Filter evaluation engine (supports INT32, INT64, FLOAT, DOUBLE, BOOLEAN, BINARY/STRING)
-- [ ] Page index-based page filtering
+- [x] Page index-based page filtering (`PageFilterEvaluator` with page-range I/O)
 - [ ] Bloom filter-based filtering
 
 ---
@@ -436,12 +436,12 @@ A from-scratch implementation of Apache Parquet reader/writer in Java with no de
 
 ### Milestone 6: Optimization Features (partial)
 - [x] Statistics reading and usage for row group filtering
-- [x] Page indexes (OffsetIndex used for page scanning; ColumnIndex deserialized, not yet used for page skipping)
-- [x] Predicate pushdown (statistics-based row group filtering)
+- [x] Page indexes (OffsetIndex for page scanning, ColumnIndex for page-level predicate filtering)
+- [x] Predicate pushdown (row group filtering via statistics, page filtering via ColumnIndex)
+- [x] Page-range I/O for filtered reads (only matching pages fetched from remote backends)
 - [x] Coalesced reads for remote backends (`ChunkRange`, `RowGroupIndexBuffers`)
 - [ ] Bloom filters
-- [ ] Page-level predicate filtering via ColumnIndex
-- [ ] **Validate**: Performance improvement with filtering
+- [x] **Validate**: Performance improvement with filtering
 
 ### Milestone 7: Production Ready (partial)
 - [x] Memory management optimization (ThreadLocal buffers for decompression, `ColumnAssemblyBuffer`)
@@ -464,7 +464,7 @@ A from-scratch implementation of Apache Parquet reader/writer in Java with no de
 
 ### Test Summary
 
-**Current: 348 test methods across core, S3, Avro, and parquet-java-compat modules**
+**Current: 429 test methods across core, S3, CLI, Avro, and parquet-java-compat modules**
 
 Progress:
 - Started (first column only): 163/215 (75.8%)
@@ -485,7 +485,7 @@ Progress:
 - After Snappy DATA_PAGE_V2 fixes: 206/215 (95.8%), 29 unit tests
 - After dict-page-offset-zero fix: 207/215 (96.3%), 29 unit tests
 - After MAP support: 207/215 (96.3%), 39 unit tests
-- Current: 348 test methods across core, S3, Avro, and parquet-java-compat modules
+- Current: 429 test methods across core, S3, CLI, Avro, and parquet-java-compat modules
 
 Remaining Failures by Category (7 total):
 - Bad data files (intentionally malformed): 6 files (includes fixed_length_byte_array which has truncated page data - PyArrow also fails)
