@@ -48,7 +48,6 @@ abstract class AbstractRowReader implements RowReader {
 
     // Row limit: 0 = unlimited
     protected long maxRows;
-    private long emittedRows;
 
     // Cached flat arrays for direct access (bypasses dataView virtual dispatch)
     private Object[] flatValueArrays;
@@ -57,11 +56,9 @@ abstract class AbstractRowReader implements RowReader {
     // Cached name-to-projected-index mapping for named fast path (built once)
     private StringToIntMap nameCache;
 
-    // Maps schema column index to projected array index for record-level filtering (built once)
-    private int[] columnMapping;
-
-    // Whether record-level filtering is active (computed once per batch in cacheFlatBatch)
-    private boolean recordFilterActive;
+    // Iteration strategy: selected once during cacheFlatBatch(), dispatched on every
+    // hasNext()/next() call. Avoids per-row branching on filter and maxRows state.
+    private IterationStrategy strategy;
     private boolean recordFilterWarningEmitted;
 
     /// Computes a batch size that keeps all column arrays for one batch within the L2 cache.
@@ -115,10 +112,14 @@ abstract class AbstractRowReader implements RowReader {
 
     /// Populates cached flat arrays from the current batch data for direct access.
     /// This eliminates virtual dispatch through BatchDataView for primitive accessors.
+    /// On first call, also selects the [IterationStrategy] for the reader's lifetime.
     private void cacheFlatBatch() {
         FlatColumnData[] flatColumnData = dataView.getFlatColumnData();
         if (flatColumnData == null) {
             flatFastPath = false;
+            if (strategy == null) {
+                selectStrategy(false);
+            }
             return;
         }
         flatFastPath = true;
@@ -140,17 +141,31 @@ abstract class AbstractRowReader implements RowReader {
             }
         }
 
-        // Build column mapping once for record-level filtering
-        if (columnMapping == null && filterPredicate != null) {
-            columnMapping = buildColumnMapping();
+        // Select iteration strategy once (first batch only)
+        if (strategy == null) {
+            boolean recordFilterActive = filterPredicate != null && flatFastPath && nameCache != null;
+            if (filterPredicate != null && !recordFilterActive && !recordFilterWarningEmitted) {
+                recordFilterWarningEmitted = true;
+                LOG.log(System.Logger.Level.WARNING,
+                        "Record-level filtering is not active because the schema contains nested columns (structs, lists, or maps). " +
+                        "Row-group and page-level filtering still apply, but non-matching rows within surviving pages will not be filtered out.");
+            }
+            selectStrategy(recordFilterActive);
         }
+    }
 
-        recordFilterActive = filterPredicate != null && flatFastPath && nameCache != null;
-        if (filterPredicate != null && !recordFilterActive && !recordFilterWarningEmitted) {
-            recordFilterWarningEmitted = true;
-            LOG.log(System.Logger.Level.WARNING,
-                    "Record-level filtering is not active because the schema contains nested columns (structs, lists, or maps). " +
-                    "Row-group and page-level filtering still apply, but non-matching rows within surviving pages will not be filtered out.");
+    /// Selects the iteration strategy once, based on whether record-level filtering
+    /// is active and whether a row limit is set.
+    private void selectStrategy(boolean recordFilterActive) {
+        if (recordFilterActive) {
+            int[] columnMapping = buildColumnMapping();
+            strategy = new FilteredIteration(columnMapping);
+        }
+        else {
+            strategy = new PlainIteration();
+        }
+        if (maxRows > 0) {
+            strategy = new LimitedIteration(strategy);
         }
     }
 
@@ -172,28 +187,21 @@ abstract class AbstractRowReader implements RowReader {
         if (closed || exhausted) {
             return false;
         }
-        if (maxRows > 0 && emittedRows >= maxRows) {
-            exhausted = true;
-            return false;
-        }
         if (!initialized) {
             initialize();
             if (!exhausted) {
                 cacheFlatBatch();
             }
-            if (exhausted) {
-                return false;
-            }
-            return recordFilterActive ? hasNextMatch() : rowIndex + 1 < batchSize;
+            return !exhausted && strategy.hasNextInBatch();
         }
-        if (rowIndex + 1 < batchSize) {
-            return recordFilterActive ? hasNextMatch() : true;
+        if (strategy.hasNextInBatch()) {
+            return true;
         }
         boolean loaded = loadNextBatch();
         if (loaded) {
             cacheFlatBatch();
         }
-        return loaded && (recordFilterActive ? hasNextMatch() : true);
+        return loaded && strategy.hasNextInBatch();
     }
 
     @Override
@@ -202,77 +210,124 @@ abstract class AbstractRowReader implements RowReader {
             initialize();
             cacheFlatBatch();
         }
-        if (pendingMatchRow >= 0) {
-            // hasNext() already found the next matching row
-            rowIndex = pendingMatchRow;
-            pendingMatchRow = -1;
+        strategy.advanceRow();
+        dataView.setRowIndex(rowIndex);
+    }
+
+    // ==================== Iteration Strategies ====================
+
+    /// Strategy for row iteration, selected once during [#cacheFlatBatch()].
+    /// Eliminates per-row branching on filter and maxRows state.
+    private interface IterationStrategy {
+        boolean hasNextInBatch();
+        void advanceRow();
+    }
+
+    /// Plain iteration: no filter, no row limit. The common case.
+    /// Accesses `rowIndex` and `batchSize` from the enclosing AbstractRowReader.
+    private final class PlainIteration implements IterationStrategy {
+        @Override
+        public boolean hasNextInBatch() {
+            return rowIndex + 1 < batchSize;
         }
-        else if (recordFilterActive) {
-            // next() called without hasNext() — scan for next match
-            hasNextMatch();
-            rowIndex = pendingMatchRow;
-            pendingMatchRow = -1;
-        }
-        else {
+
+        @Override
+        public void advanceRow() {
             rowIndex++;
         }
-        dataView.setRowIndex(rowIndex);
-        emittedRows++;
     }
 
-    /// Row index of the next matching row, found by `hasNextMatch()` and consumed by `next()`.
-    /// A value of -1 means no pending match (next() must scan or advance normally).
-    private int pendingMatchRow = -1;
+    /// Filtered iteration: record-level predicate evaluation with batch matching.
+    private final class FilteredIteration implements IterationStrategy {
+        private final int[] columnMapping;
+        private int pendingMatchRow = -1;
+        private BitSet matchingRowsInBatch;
+        private long totalRecords;
+        private long recordsKept;
 
-    /// Pre-computed set of matching rows for the current batch. Computed once per batch
-    /// by `RecordFilterEvaluator.matchBatch()` and queried via `nextSetBit()` for each
-    /// `hasNextMatch()` call. Reset to null on batch transitions.
-    private BitSet matchingRowsInBatch;
+        FilteredIteration(int[] columnMapping) {
+            this.columnMapping = columnMapping;
+        }
 
-    // Record-level filter counters for JFR reporting
-    private long totalRecords;
-    private long recordsKept;
+        @Override
+        public boolean hasNextInBatch() {
+            return findNextMatch();
+        }
 
-    /// Scans forward from `rowIndex + 1` to find the next row matching the filter.
-    /// Loads new batches as needed. Returns true if a match is found.
-    /// Must only be called when `recordFilterActive` is true.
-    private boolean hasNextMatch() {
-        while (true) {
-            // Compute match mask for current batch if not yet done
-            if (matchingRowsInBatch == null) {
-                matchingRowsInBatch = RecordFilterEvaluator.matchBatch(filterPredicate, batchSize,
-                        flatValueArrays, flatNulls, columnMapping);
-                totalRecords += batchSize;
-                recordsKept += matchingRowsInBatch.cardinality();
+        @Override
+        public void advanceRow() {
+            if (pendingMatchRow >= 0) {
+                rowIndex = pendingMatchRow;
+                pendingMatchRow = -1;
             }
-
-            // Find the next matching row after current position
-            int nextMatchingRow = matchingRowsInBatch.nextSetBit(rowIndex + 1);
-            if (nextMatchingRow >= 0 && nextMatchingRow < batchSize) {
-                pendingMatchRow = nextMatchingRow;
-                return true;
+            else {
+                findNextMatch();
+                rowIndex = pendingMatchRow;
+                pendingMatchRow = -1;
             }
+        }
 
-            // Current batch exhausted — load next
-            matchingRowsInBatch = null;
-            if (!loadNextBatch()) {
-                exhausted = true;
-                emitRecordFilterEvent();
-                return false;
+        /// Scans forward from `rowIndex + 1` to find the next row matching the filter.
+        /// Loads new batches as needed. Returns true if a match is found.
+        private boolean findNextMatch() {
+            while (true) {
+                if (matchingRowsInBatch == null) {
+                    matchingRowsInBatch = RecordFilterEvaluator.matchBatch(filterPredicate, batchSize,
+                            flatValueArrays, flatNulls, columnMapping);
+                    totalRecords += batchSize;
+                    recordsKept += matchingRowsInBatch.cardinality();
+                }
+
+                int nextMatchingRow = matchingRowsInBatch.nextSetBit(rowIndex + 1);
+                if (nextMatchingRow >= 0 && nextMatchingRow < batchSize) {
+                    pendingMatchRow = nextMatchingRow;
+                    return true;
+                }
+
+                matchingRowsInBatch = null;
+                if (!loadNextBatch()) {
+                    exhausted = true;
+                    emitFilterEvent();
+                    return false;
+                }
+                cacheFlatBatch();
+                rowIndex = -1;
             }
-            cacheFlatBatch();
-            rowIndex = -1;
+        }
+
+        private void emitFilterEvent() {
+            if (totalRecords > 0) {
+                RecordFilterEvent event = new RecordFilterEvent();
+                event.totalRecords = totalRecords;
+                event.recordsKept = recordsKept;
+                event.recordsSkipped = totalRecords - recordsKept;
+                event.commit();
+            }
         }
     }
 
-    /// Emits a JFR event summarizing record-level filtering results.
-    private void emitRecordFilterEvent() {
-        if (totalRecords > 0) {
-            RecordFilterEvent event = new RecordFilterEvent();
-            event.totalRecords = totalRecords;
-            event.recordsKept = recordsKept;
-            event.recordsSkipped = totalRecords - recordsKept;
-            event.commit();
+    /// Row-limited iteration: wraps another strategy and stops after maxRows.
+    private final class LimitedIteration implements IterationStrategy {
+        private final IterationStrategy delegate;
+        private long emittedRows;
+
+        LimitedIteration(IterationStrategy delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean hasNextInBatch() {
+            if (emittedRows >= maxRows) {
+                exhausted = true;
+                return false;
+            }
+            return delegate.hasNextInBatch();
+        }
+
+        @Override
+        public void advanceRow() {
+            delegate.advanceRow();
+            emittedRows++;
         }
     }
 
@@ -284,7 +339,6 @@ abstract class AbstractRowReader implements RowReader {
             return new int[0];
         }
         int projectedCount = projectedSchemaRef.getProjectedColumnCount();
-        // Find the max original index to size the array
         int maxOriginalIndex = 0;
         for (int i = 0; i < projectedCount; i++) {
             maxOriginalIndex = Math.max(maxOriginalIndex, projectedSchemaRef.toOriginalIndex(i));
